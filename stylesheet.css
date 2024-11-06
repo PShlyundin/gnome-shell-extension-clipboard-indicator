@@ -73,3 +73,78 @@
     height:1em;
     margin-right:.25em;
 }
+
+.workspace-buttons-container {
+    margin: 5px 0;
+    spacing: 5px;
+}
+
+.workspace-button {
+    padding: 4px 8px;
+    border-radius: 4px;
+    background-color: rgba(255,255,255,0.1);
+    min-width: 60px;
+}
+
+.workspace-button:hover {
+    background-color: rgba(255,255,255,0.2);
+}
+
+.workspace-button-content {
+    spacing: 4px;
+}
+
+.workspace-delete-button {
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border-radius: 8px;
+    background-color: rgba(255,255,255,0.1);
+}
+
+.workspace-delete-button:hover {
+    background-color: rgba(255,255,255,0.3);
+}
+
+.workspace-add-button {
+    padding: 4px;
+    border-radius: 4px;
+    background-color: rgba(255,255,255,0.1);
+    width: 24px;
+    height: 24px;
+}
+
+.workspace-add-button:hover {
+    background-color: rgba(255,255,255,0.2);
+}
+
+.workspace-name-entry {
+    width: 120px;
+    margin: 4px 0;
+}
+
+.workspace-button:active,
+.workspace-button.active {
+    background-color: rgba(255,255,255,0.3);
+}
+
+.workspace-edit-button {
+    padding: 0 4px;
+    border-radius: 4px;
+}
+
+.workspace-edit-button:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.workspace-edit-icon {
+    icon-size: 14px;
+}
+
+.workspace-name-entry {
+    min-width: 100px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background-color: rgba(255, 255, 255, 0.1);
+    color: inherit;
+}

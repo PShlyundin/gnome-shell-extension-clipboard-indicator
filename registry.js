@@ -8,200 +8,318 @@ const FileCopyFlags = Gio.FileCopyFlags;
 const FileTest = GLib.FileTest;
 
 export class Registry {
-    constructor ({ settings, uuid }) {
-        this.uuid = uuid;
-        this.settings = settings;
-        this.REGISTRY_FILE = 'registry.txt';
-        this.REGISTRY_DIR = GLib.get_user_cache_dir() + '/' + this.uuid;
-        this.REGISTRY_PATH = this.REGISTRY_DIR + '/' + this.REGISTRY_FILE;
-        this.BACKUP_REGISTRY_PATH = this.REGISTRY_PATH + '~';
+    constructor(extension) {
+        this.extension = extension;
+        this.cacheDir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'clipboard-indicator']);
+        GLib.mkdir_with_parents(this.cacheDir, 0o775);
     }
 
-    write (entries) {
-        const registryContent = [];
+    _getWorkspaceDir(workspace) {
+        if (!workspace) {
+            console.error('Workspace name is undefined');
+            workspace = 'default';
+        }
+        const dir = GLib.build_filenamev([this.cacheDir, workspace]);
+        GLib.mkdir_with_parents(dir, 0o775);
+        return dir;
+    }
 
-        for (let entry of entries) {
-            const item = {
-                favorite: entry.isFavorite(),
-                mimetype: entry.mimetype()
-            };
+    _getCacheFile(workspace) {
+        return GLib.build_filenamev([this._getWorkspaceDir(workspace), 'clipboard.json']);
+    }
 
-            registryContent.push(item);
+    _getImagesCacheDir(workspace) {
+        return this._getWorkspaceDir(workspace);
+    }
 
-            if (entry.isText()) {
-                item.contents = entry.getStringValue();
-            }
-            else if (entry.isImage()) {
-                const filename = this.getEntryFilename(entry);
-                item.contents = filename;
-                this.writeEntryFile(entry);
-            }
+    async read(workspace) {
+        const path = this._getCacheFile(workspace);
+        if (!GLib.file_test(path, FileTest.EXISTS)) {
+            return [];
         }
 
-        this.writeToFile(registryContent);
-    }
+        try {
+            const [success, contents] = GLib.file_get_contents(path);
+            if (!success) {
+                return [];
+            }
 
-    writeToFile (registry) {
-        let json = JSON.stringify(registry);
-        let contents = new GLib.Bytes(json);
-
-        // Make sure dir exists
-        GLib.mkdir_with_parents(this.REGISTRY_DIR, parseInt('0775', 8));
-
-        // Write contents to file asynchronously
-        let file = Gio.file_new_for_path(this.REGISTRY_PATH);
-        file.replace_async(null, false, Gio.FileCreateFlags.NONE,
-                            GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-
-            let stream = obj.replace_finish(res);
-
-            stream.write_bytes_async(contents, GLib.PRIORITY_DEFAULT,
-                                null, (w_obj, w_res) => {
-
-                w_obj.write_bytes_finish(w_res);
-                stream.close(null);
-            });
-        });
-    }
-
-    async read () {
-        return new Promise(resolve => {
-            if (GLib.file_test(this.REGISTRY_PATH, FileTest.EXISTS)) {
-                let file = Gio.file_new_for_path(this.REGISTRY_PATH);
-                let CACHE_FILE_SIZE = this.settings.get_int(PrefsFields.CACHE_FILE_SIZE);
-
-                file.query_info_async('*', FileQueryInfoFlags.NONE,
-                                      GLib.PRIORITY_DEFAULT, null, (src, res) => {
-                    // Check if file size is larger than CACHE_FILE_SIZE
-                    // If so, make a backup of file, and resolve with empty array
-                    let file_info = src.query_info_finish(res);
-
-                    if (file_info.get_size() >= CACHE_FILE_SIZE * 1024 * 1024) {
-                        let destination = Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH);
-
-                        file.move(destination, FileCopyFlags.OVERWRITE, null, null);
-                        resolve([]);
-                        return;
+            const decoder = new TextDecoder();
+            const entries = JSON.parse(decoder.decode(contents));
+            return entries.map(entry => {
+                try {
+                    let bytes;
+                    if (Array.isArray(entry.content)) {
+                        bytes = new Uint8Array(entry.content);
+                    } else {
+                        bytes = entry.content;
                     }
-
-                    file.load_contents_async(null, (obj, res) => {
-                        let [success, contents] = obj.load_contents_finish(res);
-
-                        if (success) {
-                            let max_size = this.settings.get_int(PrefsFields.HISTORY_SIZE);
-                            const registry = JSON.parse(new TextDecoder().decode(contents));
-                            const entriesPromises = registry.map(
-                                jsonEntry => {
-                                    return ClipboardEntry.fromJSON(jsonEntry)
-                                }
-                            );
-
-                            Promise.all(entriesPromises).then(clipboardEntries => {
-                                clipboardEntries = clipboardEntries
-                                    .filter(entry => entry !== null);
-
-                                let registryNoFavorite = clipboardEntries
-                                    .filter(entry => entry.isFavorite());
-
-                                while (registryNoFavorite.length > max_size) {
-                                    let oldestNoFavorite = registryNoFavorite.shift();
-                                    let itemIdx = clipboardEntries.indexOf(oldestNoFavorite);
-                                    clipboardEntries.splice(itemIdx,1);
-
-                                    registryNoFavorite = clipboardEntries.filter(
-                                        entry => entry.isFavorite()
-                                    );
-                                }
-
-                                resolve(clipboardEntries);
-                            }).catch(e => {
-                                console.error(e);
-                            });
-                        }
-                        else {
-                            console.error('Clipboard Indicator: failed to open registry file');
-                        }
-                    });
-                });
-            }
-            else {
-                resolve([]);
-            }
-        });
+                    return new ClipboardEntry(
+                        entry.mimeType || entry.mimetype,
+                        bytes,
+                        entry.favorite || false
+                    );
+                } catch (e) {
+                    console.error('Failed to create ClipboardEntry:', e);
+                    return null;
+                }
+            }).filter(entry => entry !== null);
+        } catch (e) {
+            console.error('Failed to read clipboard cache file:', e);
+            return [];
+        }
     }
 
-    #entryFileExists (entry) {
-        const filename = this.getEntryFilename(entry);
-        return GLib.file_test(filename, FileTest.EXISTS);
+    write(entries, workspace) {
+        const path = this._getCacheFile(workspace);
+        try {
+            const encoder = new TextEncoder();
+            const contents = encoder.encode(JSON.stringify(
+                entries.map(e => e.toJSON())
+            ));
+            
+            GLib.file_set_contents(path, contents);
+        } catch (e) {
+            console.error('Failed to write clipboard cache file:', e);
+        }
     }
 
-    async getEntryAsImage (entry) {
-        const filename = this.getEntryFilename(entry);
+    // Метод для очистки данных workspace
+    clearWorkspace(workspace) {
+        const dir = this._getWorkspaceDir(workspace);
+        try {
+            // Удаляем все файлы в директории
+            const dirFile = Gio.File.new_for_path(dir);
+            const enumerator = dirFile.enumerate_children('standard::*', Gio.FileQueryInfoFlags.NONE, null);
+            
+            let fileInfo;
+            while ((fileInfo = enumerator.next_file(null))) {
+                const child = dirFile.get_child(fileInfo.get_name());
+                child.delete(null);
+            }
+            
+            // Удаляем саму директорию
+            dirFile.delete(null);
+        } catch (e) {
+            console.error('Failed to clear workspace:', e);
+        }
+    }
 
-        if (entry.isImage() === false) return;
+    // Обновляем методы для работы с изображениями
+    getImagePath(entry, workspace) {
+        if (!workspace) {
+            console.error('Workspace name is undefined');
+            workspace = 'default';
+        }
+        if (!entry || !entry.imageHash) {
+            console.error('Invalid entry or imageHash');
+            return null;
+        }
+        return GLib.build_filenamev([this._getImagesCacheDir(workspace), entry.imageHash]);
+    }
 
-        if (this.#entryFileExists(entry) == false) {
-            await this.writeEntryFile(entry);
+    writeEntryFile(entry, workspace) {
+        if (!entry || !entry.isImage()) return;
+        if (!workspace) {
+            console.error('Workspace name is undefined');
+            workspace = 'default';
+        }
+        
+        const path = this.getImagePath(entry, workspace);
+        if (!path) return;
+        
+        try {
+            const bytes = entry.asBytes().get_data();
+            if (!bytes) {
+                console.error('No image data to write');
+                return;
+            }
+            GLib.file_set_contents(path, bytes);
+            return true;
+        } catch (e) {
+            console.error('Failed to write image file:', e);
+            return false;
+        }
+    }
+
+    deleteEntryFile(entry, workspace) {
+        if (!entry.isImage()) return;
+        
+        const path = this.getImagePath(entry, workspace);
+        try {
+            GLib.unlink(path);
+        } catch (e) {
+            console.error('Failed to delete image file:', e);
+        }
+    }
+
+    // Добавим методы для работы с конфигурацией workspace'ов
+    _getWorkspacesConfigFile() {
+        return GLib.build_filenamev([this.cacheDir, 'workspaces.json']);
+    }
+
+    saveWorkspacesConfig(workspaces, activeWorkspace) {
+        const path = this._getWorkspacesConfigFile();
+        try {
+            const config = {
+                workspaces: workspaces,
+                activeWorkspace: activeWorkspace
+            };
+            const encoder = new TextEncoder();
+            const contents = encoder.encode(JSON.stringify(config));
+            GLib.file_set_contents(path, contents);
+        } catch (e) {
+            console.error('Failed to save workspaces config:', e);
+        }
+    }
+
+    loadWorkspacesConfig() {
+        const path = this._getWorkspacesConfigFile();
+        const defaultConfig = {
+            workspaces: ['Workspace1', 'Workspace2', 'Workspace3'],
+            activeWorkspace: 'Workspace1'
+        };
+
+        if (!GLib.file_test(path, FileTest.EXISTS)) {
+            // Сохраняем дефолтную конфигурацию при первом запуске
+            this.saveWorkspacesConfig(defaultConfig.workspaces, defaultConfig.activeWorkspace);
+            return defaultConfig;
         }
 
-        const gicon = Gio.icon_new_for_string(this.getEntryFilename(entry));
-        const stIcon = new St.Icon({ gicon });
-        return stIcon;
+        try {
+            const [success, contents] = GLib.file_get_contents(path);
+            if (!success) {
+                return defaultConfig;
+            }
+
+            const decoder = new TextDecoder();
+            const config = JSON.parse(decoder.decode(contents));
+            
+            // Проверяем валидность загруженной конфигурации
+            if (!config || !Array.isArray(config.workspaces) || !config.workspaces.length || !config.activeWorkspace) {
+                console.error('Invalid workspace config, using default');
+                return defaultConfig;
+            }
+
+            // Проверяем существование директорий для каждого workspace
+            config.workspaces.forEach(workspace => {
+                const dir = this._getWorkspaceDir(workspace);
+                if (!GLib.file_test(dir, FileTest.EXISTS)) {
+                    GLib.mkdir_with_parents(dir, 0o775);
+                }
+            });
+
+            // Проверяем, что активный workspace существует в списке
+            if (!config.workspaces.includes(config.activeWorkspace)) {
+                config.activeWorkspace = config.workspaces[0];
+            }
+
+            return config;
+        } catch (e) {
+            console.error('Failed to load workspaces config:', e);
+            return defaultConfig;
+        }
     }
 
-    getEntryFilename (entry) {
-        return `${this.REGISTRY_DIR}/${entry.asBytes().hash()}`;
-    }
+    async getEntryAsImage(entry, workspace) {
+        if (!entry || !entry.isImage()) return null;
+        
+        const path = this.getImagePath(entry, workspace);
+        if (!path) return null;
 
-    async writeEntryFile (entry) {
-        if (this.#entryFileExists(entry)) return;
+        // Проверяем существование файла
+        if (!GLib.file_test(path, FileTest.EXISTS)) {
+            // Пробуем записать файл
+            const written = await this.writeEntryFile(entry, workspace);
+            if (!written) return null;
+        }
 
-        let file = Gio.file_new_for_path(this.getEntryFilename(entry));
-
-        return new Promise(resolve => {
-            file.replace_async(null, false, Gio.FileCreateFlags.NONE,
-                               GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-
-                let stream = obj.replace_finish(res);
-
-                stream.write_bytes_async(entry.asBytes(), GLib.PRIORITY_DEFAULT,
-                                         null, (w_obj, w_res) => {
-
-                    w_obj.write_bytes_finish(w_res);
-                    stream.close(null);
-                    resolve();
+        try {
+            const file = Gio.File.new_for_path(path);
+            const [success, contents] = await new Promise((resolve) => {
+                file.load_contents_async(null, (source, result) => {
+                    try {
+                        resolve(source.load_contents_finish(result));
+                    } catch (e) {
+                        console.error('Failed to load image contents:', e);
+                        resolve([false, null]);
+                    }
                 });
             });
-        });
-    }
-
-    async deleteEntryFile (entry) {
-        const file = Gio.file_new_for_path(this.getEntryFilename(entry));
-
-        try {
-            await file.delete_async(GLib.PRIORITY_DEFAULT, null);
-        }
-        catch (e) {
-            console.error(e);
-        }
-    }
-
-    clearCacheFolder() {
-
-        const CANCELLABLE = null;
-        try {
-            const folder = Gio.file_new_for_path(this.REGISTRY_DIR);
-            const enumerator = folder.enumerate_children("", 1, CANCELLABLE);
-
-            let file;
-            while ((file = enumerator.iterate(CANCELLABLE)[2]) != null) {
-                file.delete(CANCELLABLE);
+            
+            if (!success || !contents) {
+                console.error('Failed to load image from:', path);
+                return null;
             }
 
+            const gicon = Gio.BytesIcon.new(GLib.Bytes.new(contents));
+            const image = new St.Icon({
+                gicon: gicon,
+                icon_size: 24
+            });
+            
+            return image;
+        } catch (e) {
+            console.error('Failed to load image:', e);
+            return null;
         }
-        catch (e) {
-            console.error(e);
+    }
+
+    async renameWorkspace(oldName, newName) {
+        // Получаем путь к старой и новой директориям
+        const oldPath = GLib.build_filenamev([this.cacheDir, oldName]);
+        const newPath = GLib.build_filenamev([this.cacheDir, newName]);
+        
+        try {
+            const oldFile = Gio.File.new_for_path(oldPath);
+            const newFile = Gio.File.new_for_path(newPath);
+            
+            // Проверяем существование старой директории
+            if (oldFile.query_exists(null)) {
+                // Создаем новую директорию если её нет
+                if (!newFile.query_exists(null)) {
+                    newFile.make_directory_with_parents(null);
+                }
+                
+                // Добавляем задержку перед копированием
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                // Копируем все файлы из старой директории в новую
+                const enumerator = oldFile.enumerate_children('standard::*', Gio.FileQueryInfoFlags.NONE, null);
+                let fileInfo;
+                while ((fileInfo = enumerator.next_file(null))) {
+                    const fileName = fileInfo.get_name();
+                    const sourceFile = oldFile.get_child(fileName);
+                    const targetFile = newFile.get_child(fileName);
+                    
+                    // Копируем файл
+                    sourceFile.copy(targetFile, Gio.FileCopyFlags.OVERWRITE, null, null);
+                }
+                
+                // Добавляем задержку перед удалением старой директории
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                // Удаляем старую директорию после успешного копирования
+                this.clearWorkspace(oldName);
+                
+                // Обновляем конфигурацию
+                const config = await this.loadWorkspacesConfig();
+                if (config) {
+                    const index = config.workspaces.indexOf(oldName);
+                    if (index !== -1) {
+                        config.workspaces[index] = newName;
+                        if (config.activeWorkspace === oldName) {
+                            config.activeWorkspace = newName;
+                        }
+                        this.saveWorkspacesConfig(config.workspaces, config.activeWorkspace);
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('Failed to rename workspace directory:', e);
+            return false;
         }
+        return true;
     }
 }
 
@@ -209,111 +327,114 @@ export class ClipboardEntry {
     #mimetype;
     #bytes;
     #favorite;
+    #imageHash;
 
-    static #decode (contents) {
-        return Uint8Array.from(contents.match(/.{1,2}/g).map((byte) => parseInt(byte, 16)));
+    constructor (mimetype, bytes, favorite) {
+        this.#mimetype = mimetype || 'text/plain';
+        
+        // Преобразуем строку в Uint8Array если нужно
+        if (typeof bytes === 'string') {
+            this.#bytes = new TextEncoder().encode(bytes);
+        } else if (Array.isArray(bytes)) {
+            this.#bytes = new Uint8Array(bytes);
+        } else if (bytes instanceof Uint8Array) {
+            this.#bytes = bytes;
+        } else {
+            this.#bytes = new Uint8Array();
+        }
+        
+        this.#favorite = !!favorite;
+        
+        // Генерируем hash для изображений
+        if (this.isImage()) {
+            this.#imageHash = this.#generateHash();
+        }
     }
 
-    static __isText (mimetype) {
+    #generateHash() {
+        // Проверяем, что bytes существует и является Uint8Array
+        if (!this.#bytes || !(this.#bytes instanceof Uint8Array)) {
+            return 'default-hash';
+        }
+        
+        try {
+            // Используем только первые 1000 байт для ускорения
+            const bytesToHash = this.#bytes.slice(0, 1000);
+            return Array.from(bytesToHash)
+                .reduce((hash, byte) => ((hash << 5) - hash) + byte, 5381)
+                .toString(36);
+        } catch (e) {
+            console.error('Failed to generate hash:', e);
+            return 'error-hash-' + Date.now();
+        }
+    }
+
+    get imageHash() {
+        return this.#imageHash;
+    }
+
+    // Добавим метод для сериализации
+    toJSON() {
+        return {
+            mimeType: this.#mimetype,
+            content: this.isText() ? this.getStringValue() : Array.from(this.#bytes),
+            favorite: this.#favorite,
+            imageHash: this.#imageHash
+        };
+    }
+
+    // Добавим статический метод для проверки текстового типа
+    static isText(mimetype) {
         return mimetype.startsWith('text/') ||
             mimetype === 'STRING' ||
             mimetype === 'UTF8_STRING';
     }
 
-    static async fromJSON (jsonEntry) {
-        const mimetype = jsonEntry.mimetype || 'text/plain;charset=utf-8';
-        const favorite = jsonEntry.favorite;
-        let bytes;
-
-        if (ClipboardEntry.__isText(mimetype)) {
-            bytes = new TextEncoder().encode(jsonEntry.contents);
-        }
-        else {
-            const filename = jsonEntry.contents;
-            if (!GLib.file_test(filename, FileTest.EXISTS)) return null;
-
-            let file = Gio.file_new_for_path(filename);
-
-            const contentType = await file.query_info_async('*', FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-                try {
-                    const fileInfo = obj.query_info_finish(res);
-                    return fileInfo.get_content_type();
-                } catch (e) {
-                    console.error(e);
-                }
-            });
-
-            if (contentType && !contentType.startsWith('image/') && !contentType.startsWith('text/')) {
-                bytes = new TextEncoder().encode(jsonEntry.contents);
-            }
-            else {
-                bytes = await new Promise((resolve, reject) => file.load_contents_async(null, (obj, res) => {
-                    let [success, contents] = obj.load_contents_finish(res);
-
-                    if (success) {
-                        resolve(contents);
-                    }
-                    else {
-                        reject(
-                            new Error('Clipboard Indicator: could not read image file from cache')
-                        );
-                    }
-                }));
-            }
-        }
-
-        return new ClipboardEntry(mimetype, bytes, favorite);
-    }
-
-    constructor (mimetype, bytes, favorite) {
-        this.#mimetype = mimetype;
-        this.#bytes = bytes;
-        this.#favorite = favorite;
-    }
-
-    #encode () {
+    // Добавим метод для получения содержимого
+    getContent() {
         if (this.isText()) {
             return this.getStringValue();
         }
-
-        return [...this.#bytes]
-            .map(x => x.toString(16).padStart(2, '0'))
-            .join('');
+        return this.#bytes;
     }
 
-    getStringValue () {
-        if (this.isImage()) {
-            return `[Image ${this.asBytes().hash()}]`;
-        }
-        return new TextDecoder().decode(this.#bytes);
-    }
-
-    mimetype () {
+    mimetype() {
         return this.#mimetype;
     }
 
-    isFavorite () {
+    getStringValue() {
+        if (this.isImage()) {
+            return `[Image ${this.#bytes.length}]`;
+        }
+        try {
+            return new TextDecoder().decode(this.#bytes);
+        } catch (e) {
+            console.error('Failed to decode bytes:', e);
+            return '[Invalid content]';
+        }
+    }
+
+    isFavorite() {
         return this.#favorite;
     }
 
-    set favorite (val) {
+    set favorite(val) {
         this.#favorite = !!val;
     }
 
-    isText () {
-        return ClipboardEntry.__isText(this.#mimetype);
+    isText() {
+        return ClipboardEntry.isText(this.#mimetype);
     }
 
-    isImage () {
+    isImage() {
         return this.#mimetype.startsWith('image/');
     }
 
-    asBytes () {
+    asBytes() {
         return GLib.Bytes.new(this.#bytes);
     }
 
-    equals (otherEntry) {
+    equals(otherEntry) {
         return this.getStringValue() === otherEntry.getStringValue();
-        // this.asBytes().equal(otherEntry.asBytes());
     }
 }

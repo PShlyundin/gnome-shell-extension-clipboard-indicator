@@ -3,6 +3,7 @@ import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
+import GLib from 'gi://GLib';
 
 import * as AnimationUtils from 'resource:///org/gnome/shell/misc/animationUtils.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
@@ -71,6 +72,11 @@ const ClipboardIndicator = GObject.registerClass({
         this.dialogManager.destroy();
         this.keyboard.destroy();
 
+        if (this._keyPressEventId) {
+            global.stage.disconnect(this._keyPressEventId);
+            this._keyPressEventId = null;
+        }
+
         super.destroy();
     }
 
@@ -78,6 +84,18 @@ const ClipboardIndicator = GObject.registerClass({
         super._init(0.0, "ClipboardIndicator");
         this.extension = extension;
         this.registry = new Registry(extension);
+        
+        // Загружаем конфигурацию workspace'ов
+        const config = this.registry.loadWorkspacesConfig();
+        if (!config) {
+            console.error('Failed to load workspace config');
+            this.workspaces = ['Workspace1', 'Workspace2', 'Workspace3'];
+            this.activeWorkspace = 'Workspace1';
+        } else {
+            this.workspaces = config.workspaces;
+            this.activeWorkspace = config.activeWorkspace;
+        }
+        
         this.keyboard = new Keyboard();
         this._settingsChangedId = null;
         this._selectionOwnerChangedId = null;
@@ -142,167 +160,462 @@ const ClipboardIndicator = GObject.registerClass({
             else if (entry.isImage()) {
                 this._buttonText.set_text('');
                 this._buttonImgPreview.destroy_all_children();
-                this.registry.getEntryAsImage(entry).then(img => {
-                    img.add_style_class_name('clipboard-indicator-img-preview');
-                    img.y_align = Clutter.ActorAlign.CENTER;
+                this.registry.getEntryAsImage(entry, this.activeWorkspace).then(img => {
+                    if (img) {
+                        img.add_style_class_name('clipboard-indicator-img-preview');
+                        img.y_align = Clutter.ActorAlign.CENTER;
 
-                    // icon only renders properly in setTimeout for some arcane reason
-                    this._imagePreviewTimeout = setTimeout(() => {
-                        this._buttonImgPreview.set_child(img);
-                    }, 0);
+                        // icon only renders properly in setTimeout for some arcane reason
+                        this._imagePreviewTimeout = setTimeout(() => {
+                            this._buttonImgPreview.set_child(img);
+                        }, 0);
+                    }
                 });
             }
         }
     }
 
     async _buildMenu () {
-        let that = this;
-        const clipHistory = await this._getCache();
-        let lastIdx = clipHistory.length - 1;
-        let clipItemsArr = that.clipItemsRadioGroup;
+        try {
+            let that = this;
+            const clipHistory = await this._getCache();
+            let lastIdx = clipHistory.length - 1;
+            let clipItemsArr = that.clipItemsRadioGroup;
 
-        /* This create the search entry, which is add to a menuItem.
-        The searchEntry is connected to the function for research.
-        The menu itself is connected to some shitty hack in order to
-        grab the focus of the keyboard. */
-        that._entryItem = new PopupMenu.PopupBaseMenuItem({
-            reactive: false,
-            can_focus: false
-        });
-        that.searchEntry = new St.Entry({
-            name: 'searchEntry',
-            style_class: 'search-entry',
-            can_focus: true,
-            hint_text: _('Type here to search...'),
-            track_hover: true,
-            x_expand: true,
-            y_expand: true,
-            primary_icon: new St.Icon({ icon_name: 'edit-find-symbolic' })
-        });
+            /* This create the search entry, which is add to a menuItem.
+            The searchEntry is connected to the function for research.
+            The menu itself is connected to some shitty hack in order to
+            grab the focus of the keyboard. */
+            that._entryItem = new PopupMenu.PopupBaseMenuItem({
+                reactive: false,
+                can_focus: false
+            });
+            that.searchEntry = new St.Entry({
+                name: 'searchEntry',
+                style_class: 'search-entry',
+                can_focus: true,
+                hint_text: _('Type here to search...'),
+                track_hover: true,
+                x_expand: true,
+                y_expand: true,
+                primary_icon: new St.Icon({ icon_name: 'edit-find-symbolic' })
+            });
 
-        that.searchEntry.get_clutter_text().connect(
-            'text-changed',
-            that._onSearchTextChanged.bind(that)
-        );
+            that.searchEntry.get_clutter_text().connect(
+                'text-changed',
+                that._onSearchTextChanged.bind(that)
+            );
 
-        that._entryItem.add_child(that.searchEntry);
+            that._entryItem.add_child(that.searchEntry);
 
-        that.menu.connect('open-state-changed', (self, open) => {
-            this._setFocusOnOpenTimeout = setTimeout(() => {
+            that.menu.connect('open-state-changed', (self, open) => {
                 if (open) {
+                    // Добавляем обработчик клавиш при открытии меню
+                    this._keyPressEventId = global.stage.connect('key-press-event', (actor, event) => {
+                        const symbol = event.get_key_symbol();
+                        const modifiers = event.get_state();
+                        const controlPressed = (modifiers & Clutter.ModifierType.CONTROL_MASK) !== 0;
+
+                        if (controlPressed) {
+                            switch (symbol) {
+                                case Clutter.KEY_bracketleft:  // Ctrl + [
+                                    this._switchToPreviousWorkspace();
+                                    return Clutter.EVENT_STOP;
+                                case Clutter.KEY_bracketright: // Ctrl + ]
+                                    this._switchToNextWorkspace();
+                                    return Clutter.EVENT_STOP;
+                            }
+                        }
+                        return Clutter.EVENT_PROPAGATE;
+                    });
+
+                    // Существующий код фокуса
                     if (this.clipItemsRadioGroup.length > 0) {
                         that.searchEntry.set_text('');
                         global.stage.set_key_focus(that.searchEntry);
-                    }
-                    else {
+                    } else {
                         global.stage.set_key_focus(that.privateModeMenuItem);
+                    }
+                } else {
+                    // Отключаем обработчик при закрытии меню
+                    if (this._keyPressEventId) {
+                        global.stage.disconnect(this._keyPressEventId);
+                        this._keyPressEventId = null;
                     }
                 }
             }, 50);
-        });
 
-        // Create menu sections for items
-        // Favorites
-        that.favoritesSection = new PopupMenu.PopupMenuSection();
+            // Add workspace buttons container
+            const workspaceButtonsBox = new St.BoxLayout({
+                style_class: 'workspace-buttons-container',
+                x_expand: true,
+                x_align: Clutter.ActorAlign.FILL
+            });
+            
+            // Create workspace buttons for each saved workspace
+            for (let workspaceName of this.workspaces) {
+                const buttonContent = new St.BoxLayout({
+                    style_class: 'workspace-button-content'
+                });
+                
+                const label = new St.Label({
+                    text: workspaceName,
+                    y_align: Clutter.ActorAlign.CENTER
+                });
+                
+                // Добвляем кнопку редактирования
+                const editIcon = new St.Icon({
+                    icon_name: 'document-edit-symbolic',
+                    style_class: 'workspace-edit-icon',
+                    icon_size: 14
+                });
+                
+                const editButton = new St.Button({
+                    style_class: 'workspace-edit-button',
+                    child: editIcon
+                });
+                
+                const deleteIcon = new St.Icon({
+                    icon_name: 'window-close-symbolic',
+                    style_class: 'workspace-delete-icon',
+                    icon_size: 14
+                });
+                
+                const deleteButton = new St.Button({
+                    style_class: 'workspace-delete-button',
+                    child: deleteIcon
+                });
+                
+                const button = new St.Button({
+                    style_class: 'workspace-button',
+                    x_expand: true
+                });
+                
+                buttonContent.add_child(label);
+                buttonContent.add_child(editButton);
+                buttonContent.add_child(deleteButton);
+                button.set_child(buttonContent);
+                
+                // Добавляем обработчик для кнопки редактирования
+                editButton.connect('clicked', () => {
+                    // Сохраняем старое имя
+                    const oldName = workspaceName;
+                    
+                    // Удаляем label и добавляем поле ввода
+                    buttonContent.remove_child(label);
+                    const entry = new St.Entry({
+                        style_class: 'workspace-name-entry',
+                        text: workspaceName,
+                        can_focus: true
+                    });
+                    buttonContent.insert_child_at_index(entry, 0);
+                    
+                    // Скрываем кнопки редактирования и удаления во время редактирования
+                    editButton.hide();
+                    deleteButton.hide();
+                    
+                    // Устанавливаем фокус на поле ввода
+                    global.stage.set_key_focus(entry);
+                    
+                    // Обработчик завершения редактирования
+                    entry.clutter_text.connect('activate', async () => {
+                        const newName = entry.get_text().trim();
+                        if (newName && newName !== oldName) {
+                            // Обновляем имя в массиве
+                            const index = this.workspaces.indexOf(oldName);
+                            if (index !== -1) {
+                                // Пробуем переименовать workspace в registry
+                                if (await this.registry.renameWorkspace(oldName, newName)) {
+                                    this.workspaces[index] = newName;
+                                    
+                                    // Если редактируем активный workspace, обновляем его имя
+                                    if (this.activeWorkspace === oldName) {
+                                        this.activeWorkspace = newName;
+                                        
+                                        // Очищаем текущие элементы меню
+                                        this.historySection._getMenuItems().forEach(item => item.destroy());
+                                        this.favoritesSection._getMenuItems().forEach(item => item.destroy());
+                                        this.clipItemsRadioGroup = [];
+                                        
+                                        // Загружаем данные переименованного workspace
+                                        const clipHistory = await this._getCache();
+                                        clipHistory.forEach(entry => this._addEntry(entry));
+                                        if (clipHistory.length > 0) {
+                                            this._selectMenuItem(this.clipItemsRadioGroup[clipHistory.length - 1]);
+                                        }
+                                    }
+                                    
+                                    // Сохраняем конфигурацию
+                                    this._saveWorkspacesConfig();
+                                    
+                                    // Обновляем label
+                                    label.set_text(newName);
+                                } else {
+                                    // Если произошла ошибка при переименовании, показываем уведомление
+                                    this._showNotification(_("Failed to rename workspace"));
+                                }
+                            }
+                        }
+                        
+                        // Возвращаем label и кнопки обратно
+                        buttonContent.remove_child(entry);
+                        buttonContent.insert_child_at_index(label, 0);
+                        editButton.show();
+                        deleteButton.show();
+                    });
+                    
+                    // Обработчик отмены редактирования (Esc)
+                    entry.clutter_text.connect('key-press-event', (actor, event) => {
+                        if (event.get_key_symbol() === Clutter.KEY_Escape) {
+                            buttonContent.remove_child(entry);
+                            buttonContent.insert_child_at_index(label, 0);
+                            editButton.show();
+                            deleteButton.show();
+                            return Clutter.EVENT_STOP;
+                        }
+                        return Clutter.EVENT_PROPAGATE;
+                    });
+                });
+                
+                // Добавляем обработчик клика для кнопки workspace
+                button.connect('clicked', () => {
+                    // Получаем актуальное имя из текста label
+                    const currentName = label.get_text();
+                    this._switchWorkspace(currentName);
+                    workspaceButtonsBox.get_children().forEach(child => {
+                        child.remove_style_pseudo_class('active');
+                    });
+                    button.add_style_pseudo_class('active');
+                });
+                
+                // Если это активный workspace, выделяем его
+                if (workspaceName === this.activeWorkspace) {
+                    button.add_style_pseudo_class('active');
+                }
+                
+                deleteButton.connect('clicked', () => {
+                    if (this.workspaces.length > 1) {
+                        // Получаем актуальное имя из текста label
+                        const currentName = label.get_text();
+                        const idx = this.workspaces.indexOf(currentName);
+                        this.workspaces.splice(idx, 1);
+                        workspaceButtonsBox.remove_child(button);
+                        
+                        // Очищаем данные удаляемого workspace
+                        this.registry.clearWorkspace(currentName);
+                        
+                        // Если удаляем активный workspace, переключимся на другой
+                        if (this.activeWorkspace === currentName) {
+                            this._switchWorkspace(this.workspaces[0]);
+                        }
+                        
+                        // Сохраняем конфигурацию
+                        this._saveWorkspacesConfig();
+                    }
+                });
+                
+                workspaceButtonsBox.add_child(button);
+            }
+            
+            // Add "+" button
+            const addIcon = new St.Icon({
+                icon_name: 'list-add-symbolic',
+                style_class: 'workspace-add-icon',
+                icon_size: 16
+            });
+            
+            const addButton = new St.Button({
+                style_class: 'workspace-add-button',
+                child: addIcon
+            });
+            
+            addButton.connect('clicked', () => {
+                // Create new workspace button with entry
+                const buttonContent = new St.BoxLayout({
+                    style_class: 'workspace-button-content'
+                });
+                
+                const entry = new St.Entry({
+                    style_class: 'workspace-name-entry',
+                    hint_text: 'Enter name...',
+                    can_focus: true
+                });
+                
+                const deleteIcon = new St.Icon({
+                    icon_name: 'window-close-symbolic',
+                    style_class: 'workspace-delete-icon',
+                    icon_size: 14
+                });
+                
+                const deleteButton = new St.Button({
+                    style_class: 'workspace-delete-button',
+                    child: deleteIcon
+                });
+                
+                const button = new St.Button({
+                    style_class: 'workspace-button',
+                    x_expand: true
+                });
+                
+                buttonContent.add_child(entry);
+                buttonContent.add_child(deleteButton);
+                button.set_child(buttonContent);
+                
+                deleteButton.connect('clicked', () => {
+                    workspaceButtonsBox.remove_child(button);
+                });
+                
+                entry.clutter_text.connect('activate', () => {
+                    const name = entry.get_text();
+                    if (name) {
+                        buttonContent.remove_child(entry);
+                        const label = new St.Label({
+                            text: name,
+                            y_align: Clutter.ActorAlign.CENTER
+                        });
+                        buttonContent.insert_child_at_index(label, 0);
+                        
+                        // Добавляем новый workspace в писок
+                        this.workspaces.push(name);
+                        
+                        // Добавляем обработчик клика
+                        button.connect('clicked', () => {
+                            this._switchWorkspace(name);
+                            // Добавим визуальное выделение активного workspace
+                            workspaceButtonsBox.get_children().forEach(child => {
+                                child.remove_style_pseudo_class('active');
+                            });
+                            button.add_style_pseudo_class('active');
+                        });
+                        
+                        // Сохраняем конфигурацию
+                        this._saveWorkspacesConfig();
+                        
+                        // Автоматически переключаемся на новый workspace
+                        this._switchWorkspace(name);
+                        workspaceButtonsBox.get_children().forEach(child => {
+                            child.remove_style_pseudo_class('active');
+                        });
+                        button.add_style_pseudo_class('active');
+                    }
+                });
+                
+                // Вствляем новую кнопку перед кнопкой добавления
+                const addButtonIndex = workspaceButtonsBox.get_children().indexOf(addButton);
+                workspaceButtonsBox.insert_child_at_index(button, addButtonIndex);
+                
+                global.stage.set_key_focus(entry);
+            });
+            
+            workspaceButtonsBox.add_child(addButton);
+            
+            this.menu.box.add_child(workspaceButtonsBox);
 
-        that.scrollViewFavoritesMenuSection = new PopupMenu.PopupMenuSection();
-        this.favoritesScrollView = new St.ScrollView({
-            style_class: 'ci-history-menu-section',
-            overlay_scrollbars: true
-        });
-        this.favoritesScrollView.add_child(that.favoritesSection.actor);
+            // Create menu sections for items
+            // Favorites
+            that.favoritesSection = new PopupMenu.PopupMenuSection();
 
-        that.scrollViewFavoritesMenuSection.actor.add_child(this.favoritesScrollView);
-        this.favoritesSeparator = new PopupMenu.PopupSeparatorMenuItem();
+            that.scrollViewFavoritesMenuSection = new PopupMenu.PopupMenuSection();
+            this.favoritesScrollView = new St.ScrollView({
+                style_class: 'ci-history-menu-section',
+                overlay_scrollbars: true
+            });
+            this.favoritesScrollView.add_child(that.favoritesSection.actor);
 
-        // History
-        that.historySection = new PopupMenu.PopupMenuSection();
+            that.scrollViewFavoritesMenuSection.actor.add_child(this.favoritesScrollView);
+            this.favoritesSeparator = new PopupMenu.PopupSeparatorMenuItem();
 
-        that.scrollViewMenuSection = new PopupMenu.PopupMenuSection();
-        this.historyScrollView = new St.ScrollView({
-            style_class: 'ci-main-menu-section ci-history-menu-section',
-            overlay_scrollbars: true
-        });
-        this.historyScrollView.add_child(that.historySection.actor);
+            // History
+            that.historySection = new PopupMenu.PopupMenuSection();
 
-        that.scrollViewMenuSection.actor.add_child(this.historyScrollView);
+            that.scrollViewMenuSection = new PopupMenu.PopupMenuSection();
+            this.historyScrollView = new St.ScrollView({
+                style_class: 'ci-main-menu-section ci-history-menu-section',
+                overlay_scrollbars: true
+            });
+            this.historyScrollView.add_child(that.historySection.actor);
 
-        // Add separator
-        this.historySeparator = new PopupMenu.PopupSeparatorMenuItem();
+            that.scrollViewMenuSection.actor.add_child(this.historyScrollView);
 
-        // Add sections ordered according to settings
-        if (PINNED_ON_BOTTOM) {
-            that.menu.addMenuItem(that.scrollViewMenuSection);
-            that.menu.addMenuItem(that.scrollViewFavoritesMenuSection);
+            // Add separator
+            this.historySeparator = new PopupMenu.PopupSeparatorMenuItem();
+
+            // Add sections ordered according to settings
+            if (PINNED_ON_BOTTOM) {
+                that.menu.addMenuItem(that.scrollViewMenuSection);
+                that.menu.addMenuItem(that.scrollViewFavoritesMenuSection);
+            }
+            else {
+                that.menu.addMenuItem(that.scrollViewFavoritesMenuSection);
+                that.menu.addMenuItem(that.scrollViewMenuSection);
+            }
+
+            // Private mode switch
+            that.privateModeMenuItem = new PopupMenu.PopupSwitchMenuItem(
+                _("Private mode"), PRIVATEMODE, { reactive: true });
+            that.privateModeMenuItem.connect('toggled',
+                that._onPrivateModeSwitch.bind(that));
+            that.privateModeMenuItem.insert_child_at_index(
+                new St.Icon({
+                    icon_name: 'security-medium-symbolic',
+                    style_class: 'clipboard-menu-icon',
+                    y_align: Clutter.ActorAlign.CENTER
+                }),
+                0
+            );
+            that.menu.addMenuItem(that.privateModeMenuItem);
+
+            // Add 'Clear' button which removes all items from cache
+            this.clearMenuItem = new PopupMenu.PopupMenuItem(_('Clear history'));
+            this.clearMenuItem.insert_child_at_index(
+                new St.Icon({
+                    icon_name: 'user-trash-symbolic',
+                    style_class: 'clipboard-menu-icon',
+                    y_align: Clutter.ActorAlign.CENTER
+                }),
+                0
+            );
+            this.clearMenuItem.connect('activate', that._removeAll.bind(that));
+
+            // Add 'Settings' menu item to open settings
+            this.settingsMenuItem = new PopupMenu.PopupMenuItem(_('Settings'));
+            this.settingsMenuItem.insert_child_at_index(
+                new St.Icon({
+                    icon_name: 'preferences-system-symbolic',
+                    style_class: 'clipboard-menu-icon',
+                    y_align: Clutter.ActorAlign.CENTER
+                }),
+                0
+            );
+            that.menu.addMenuItem(this.settingsMenuItem);
+            this.settingsMenuItem.connect('activate', that._openSettings.bind(that));
+
+            // Empty state section
+            this.emptyStateSection = new St.BoxLayout({
+                style_class: 'clipboard-indicator-empty-state',
+                vertical: true
+            });
+            this.emptyStateSection.add_child(new St.Icon({
+                icon_name: INDICATOR_ICON,
+                style_class: 'system-status-icon clipboard-indicator-icon',
+                x_align: Clutter.ActorAlign.CENTER
+            }));
+            this.emptyStateSection.add_child(new St.Label({
+                text: _('Clipboard is empty'),
+                x_align: Clutter.ActorAlign.CENTER
+            }));
+
+            // Add cached items
+            clipHistory.forEach(entry => this._addEntry(entry));
+
+            if (lastIdx >= 0) {
+                that._selectMenuItem(clipItemsArr[lastIdx]);
+            }
+
+            this.#showElements();
+        } catch (e) {
+            console.error('Failed to build menu:', e);
         }
-        else {
-            that.menu.addMenuItem(that.scrollViewFavoritesMenuSection);
-            that.menu.addMenuItem(that.scrollViewMenuSection);
-        }
-
-        // Private mode switch
-        that.privateModeMenuItem = new PopupMenu.PopupSwitchMenuItem(
-            _("Private mode"), PRIVATEMODE, { reactive: true });
-        that.privateModeMenuItem.connect('toggled',
-            that._onPrivateModeSwitch.bind(that));
-        that.privateModeMenuItem.insert_child_at_index(
-            new St.Icon({
-                icon_name: 'security-medium-symbolic',
-                style_class: 'clipboard-menu-icon',
-                y_align: Clutter.ActorAlign.CENTER
-            }),
-            0
-        );
-        that.menu.addMenuItem(that.privateModeMenuItem);
-
-        // Add 'Clear' button which removes all items from cache
-        this.clearMenuItem = new PopupMenu.PopupMenuItem(_('Clear history'));
-        this.clearMenuItem.insert_child_at_index(
-            new St.Icon({
-                icon_name: 'user-trash-symbolic',
-                style_class: 'clipboard-menu-icon',
-                y_align: Clutter.ActorAlign.CENTER
-            }),
-            0
-        );
-        this.clearMenuItem.connect('activate', that._removeAll.bind(that));
-
-        // Add 'Settings' menu item to open settings
-        this.settingsMenuItem = new PopupMenu.PopupMenuItem(_('Settings'));
-        this.settingsMenuItem.insert_child_at_index(
-            new St.Icon({
-                icon_name: 'preferences-system-symbolic',
-                style_class: 'clipboard-menu-icon',
-                y_align: Clutter.ActorAlign.CENTER
-            }),
-            0
-        );
-        that.menu.addMenuItem(this.settingsMenuItem);
-        this.settingsMenuItem.connect('activate', that._openSettings.bind(that));
-
-        // Empty state section
-        this.emptyStateSection = new St.BoxLayout({
-            style_class: 'clipboard-indicator-empty-state',
-            vertical: true
-        });
-        this.emptyStateSection.add_child(new St.Icon({
-            icon_name: INDICATOR_ICON,
-            style_class: 'system-status-icon clipboard-indicator-icon',
-            x_align: Clutter.ActorAlign.CENTER
-        }));
-        this.emptyStateSection.add_child(new St.Label({
-            text: _('Clipboard is empty'),
-            x_align: Clutter.ActorAlign.CENTER
-        }));
-
-        // Add cached items
-        clipHistory.forEach(entry => this._addEntry(entry));
-
-        if (lastIdx >= 0) {
-            that._selectMenuItem(clipItemsArr[lastIdx]);
-        }
-
-        this.#showElements();
     }
 
     #hideElements() {
@@ -391,13 +704,16 @@ const ClipboardIndicator = GObject.registerClass({
             menuItem.label.set_text(this._truncate(entry.getStringValue(), MAX_ENTRY_LENGTH));
         }
         else if (entry.isImage()) {
-            this.registry.getEntryAsImage(entry).then(img => {
-                img.add_style_class_name('clipboard-menu-img-preview');
-                if (menuItem.previewImage) {
-                    menuItem.remove_child(menuItem.previewImage);
+            menuItem.label.set_text('[Image]');
+            this.registry.getEntryAsImage(entry, this.activeWorkspace).then(img => {
+                if (img) {
+                    img.add_style_class_name('clipboard-menu-img-preview');
+                    if (menuItem.previewImage) {
+                        menuItem.remove_child(menuItem.previewImage);
+                    }
+                    menuItem.previewImage = img;
+                    menuItem.insert_child_below(img, menuItem.label);
                 }
-                menuItem.previewImage = img;
-                menuItem.insert_child_below(img, menuItem.label);
             });
         }
     }
@@ -607,7 +923,7 @@ const ClipboardIndicator = GObject.registerClass({
         this.clipItemsRadioGroup.splice(itemIdx,1);
 
         if (menuItem.entry.isImage()) {
-            this.registry.deleteEntryFile(menuItem.entry);
+            this.registry.deleteEntryFile(menuItem.entry, this.activeWorkspace);
         }
 
         this._updateCache();
@@ -616,6 +932,9 @@ const ClipboardIndicator = GObject.registerClass({
 
     _removeOldestEntries () {
         let that = this;
+
+        // Если MAX_REGISTRY_LENGTH равен 0, не удаляем старые записи
+        if (MAX_REGISTRY_LENGTH === 0) return;
 
         let clipItemsRadioGroupNoFavorite = that.clipItemsRadioGroup.filter(
             item => item.entry.isFavorite() === false);
@@ -677,15 +996,7 @@ const ClipboardIndicator = GObject.registerClass({
     }
 
     _getCache () {
-        return this.registry.read();
-    }
-
-    #addToCache (entry) {
-        const entries = this.clipItemsRadioGroup
-            .map(menuItem => menuItem.entry)
-            .filter(entry => CACHE_ONLY_FAVORITE == false || entry.isFavorite())
-            .concat([entry]);
-        this.registry.write(entries);
+        return this.registry.read(this.activeWorkspace);
     }
 
     _updateCache () {
@@ -693,7 +1004,15 @@ const ClipboardIndicator = GObject.registerClass({
             .map(menuItem => menuItem.entry)
             .filter(entry => CACHE_ONLY_FAVORITE == false || entry.isFavorite());
 
-        this.registry.write(entries);
+        this.registry.write(entries, this.activeWorkspace);
+    }
+
+    #addToCache (entry) {
+        const entries = this.clipItemsRadioGroup
+            .map(menuItem => menuItem.entry)
+            .filter(entry => CACHE_ONLY_FAVORITE == false || entry.isFavorite())
+            .concat([entry]);
+        this.registry.write(entries, this.activeWorkspace);
     }
 
     async _onSelectionChange (selection, selectionType, selectionSource) {
@@ -711,33 +1030,43 @@ const ClipboardIndicator = GObject.registerClass({
             const result = await this.#getClipboardContent();
 
             if (result) {
+                // Проверяем, есть ли такой элемент уже в списке
+                let existingItem = null;
                 for (let menuItem of this.clipItemsRadioGroup) {
                     if (menuItem.entry.equals(result)) {
-                        this._selectMenuItem(menuItem, false);
-
-                        if (!menuItem.entry.isFavorite() && MOVE_ITEM_FIRST) {
-                            this._moveItemFirst(menuItem);
-                        }
-
-                        return;
+                        existingItem = menuItem;
+                        break;
                     }
                 }
 
-                this.#addToCache(result);
-                this._addEntry(result, true, false);
-                this._removeOldestEntries();
-                if (NOTIFY_ON_COPY) {
-                    this._showNotification(_("Copied to clipboard"), notif => {
-                        notif.addAction(_('Cancel'), this._cancelNotification);
-                    });
+                if (existingItem) {
+                    this._selectMenuItem(existingItem, false);
+                    if (!existingItem.entry.isFavorite() && MOVE_ITEM_FIRST) {
+                        this._moveItemFirst(existingItem);
+                    }
+                } else {
+                    // Проверяем лимит только если MAX_REGISTRY_LENGTH не равен 0
+                    if (MAX_REGISTRY_LENGTH === 0 || 
+                        this.clipItemsRadioGroup.filter(item => !item.entry.isFavorite()).length < MAX_REGISTRY_LENGTH) {
+                        this.#addToCache(result);
+                        this._addEntry(result, true, false);
+                    } else {
+                        // Если достигнут лимит, удаляем самый старый не избранный элемент
+                        this._removeOldestEntries();
+                        this.#addToCache(result);
+                        this._addEntry(result, true, false);
+                    }
+
+                    if (NOTIFY_ON_COPY) {
+                        this._showNotification(_("Copied to clipboard"), notif => {
+                            notif.addAction(_('Cancel'), this._cancelNotification);
+                        });
+                    }
                 }
             }
-        }
-        catch (e) {
-            console.error('Clipboard Indicator: Failed to refresh indicator');
-            console.error(e);
-        }
-        finally {
+        } catch (e) {
+            console.error('Failed to refresh indicator:', e);
+        } finally {
             this.#refreshInProgress = false;
         }
     }
@@ -893,8 +1222,9 @@ const ClipboardIndicator = GObject.registerClass({
 
         this._fetchSettings();
 
-        if (ENABLE_KEYBINDING)
+        if (ENABLE_KEYBINDING) {
             this._bindShortcuts();
+        }
     }
 
     _fetchSettings () {
@@ -1087,7 +1417,32 @@ const ClipboardIndicator = GObject.registerClass({
     }
 
     _toggleMenu () {
-        this.menu.toggle();
+        if (this.menu.isOpen) {
+            this.menu.close();
+            if (this._keyPressEventId) {
+                global.stage.disconnect(this._keyPressEventId);
+                this._keyPressEventId = null;
+            }
+        } else {
+            this.menu.open();
+            this._keyPressEventId = global.stage.connect('key-press-event', (actor, event) => {
+                const symbol = event.get_key_symbol();
+                const modifiers = event.get_state();
+                const controlPressed = (modifiers & Clutter.ModifierType.CONTROL_MASK) !== 0;
+
+                if (controlPressed) {
+                    switch (symbol) {
+                        case Clutter.KEY_bracketleft:  // Ctrl + [
+                            this._switchToPreviousWorkspace();
+                            return Clutter.EVENT_STOP;
+                        case Clutter.KEY_bracketright: // Ctrl + ]
+                            this._switchToNextWorkspace();
+                            return Clutter.EVENT_STOP;
+                    }
+                }
+                return Clutter.EVENT_PROPAGATE;
+            });
+        }
     }
 
     #pasteItem (menuItem) {
@@ -1136,37 +1491,146 @@ const ClipboardIndicator = GObject.registerClass({
     }
 
     async #getClipboardContent () {
-        const mimetypes = [
-            "text/plain;charset=utf-8",
-            "UTF8_STRING",
-            "text/plain",
-            "STRING",
-            'image/gif',
-            'image/png',
-            'image/jpg',
-            'image/jpeg',
-            'image/webp',
-            'image/svg+xml',
-            'text/html',
-        ];
+        try {
+            const mimetypes = [
+                "text/plain;charset=utf-8",
+                "UTF8_STRING",
+                "text/plain",
+                "STRING",
+                'image/gif',
+                'image/png',
+                'image/jpg',
+                'image/jpeg',
+                'image/webp',
+                'image/svg+xml',
+                'text/html',
+            ];
 
-        for (let type of mimetypes) {
-            let result = await new Promise(resolve => this.extension.clipboard.get_content(CLIPBOARD_TYPE, type, (clipBoard, bytes) => {
-                if (bytes === null || bytes.get_size() === 0) {
-                    resolve(null);
-                    return;
+            for (let type of mimetypes) {
+                try {
+                    let result = await new Promise((resolve, reject) => {
+                        this.extension.clipboard.get_content(CLIPBOARD_TYPE, type, (clipBoard, bytes) => {
+                            try {
+                                if (bytes === null || bytes.get_size() === 0) {
+                                    resolve(null);
+                                    return;
+                                }
+
+                                const entry = new ClipboardEntry(type, bytes.get_data(), false);
+                                if (entry.isImage()) {
+                                    this.registry.writeEntryFile(entry, this.activeWorkspace);
+                                }
+                                resolve(entry);
+                            } catch (e) {
+                                reject(e);
+                            }
+                        });
+                    });
+
+                    if (result) return result;
+                } catch (e) {
+                    console.error(`Failed to get clipboard content for type ${type}:`, e);
+                    continue;
                 }
+            }
 
-                const entry = new ClipboardEntry(type, bytes.get_data(), false);
-                if (entry.isImage()) {
-                    this.registry.writeEntryFile(entry);
-                }
-                resolve(entry);
-            }));
-
-            if (result) return result;
+            return null;
+        } catch (e) {
+            console.error('Failed to get clipboard content:', e);
+            return null;
         }
+    }
 
-        return null;
+    async _switchWorkspace(name) {
+        try {
+            // Проверяем существование workspace в списке
+            if (!this.workspaces.includes(name)) {
+                console.error('Workspace not found:', name);
+                // Если workspace не существует, переключаемся на первый доступный
+                name = this.workspaces[0];
+            }
+
+            // Сохраняем текущее состояние перед переключением
+            this._updateCache();
+            
+            // Очищаем текущие элементы меню
+            this.historySection._getMenuItems().forEach(item => item.destroy());
+            this.favoritesSection._getMenuItems().forEach(item => item.destroy());
+            this.clipItemsRadioGroup = [];
+            
+            // Добавляем задержку, чтобы дать время на завершение операций с файлами
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Переключим активный workspace
+            this.activeWorkspace = name;
+            
+            // Сохраняем конфигурацию
+            this._saveWorkspacesConfig();
+            
+            // Добавляем еще одну задержку перед загрузкой данных
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Загружаем данные нового workspace
+            const clipHistory = await this._getCache();
+            
+            // Проверяем, что данные загрузились
+            if (!clipHistory || clipHistory.length === 0) {
+                console.log('Loading data for workspace:', this.activeWorkspace);
+                // Пробуем загрузить еще раз
+                await new Promise(resolve => setTimeout(resolve, 200));
+                const retryHistory = await this._getCache();
+                if (retryHistory && retryHistory.length > 0) {
+                    retryHistory.forEach(entry => this._addEntry(entry));
+                    this._selectMenuItem(this.clipItemsRadioGroup[retryHistory.length - 1]);
+                }
+            } else {
+                clipHistory.forEach(entry => this._addEntry(entry));
+                this._selectMenuItem(this.clipItemsRadioGroup[clipHistory.length - 1]);
+            }
+        } catch (e) {
+            console.error('Failed to switch workspace:', e);
+            this._showNotification(_("Failed to switch workspace"));
+        }
+    }
+
+    // Добавим метод для сохранения конфигурации
+    _saveWorkspacesConfig() {
+        this.registry.saveWorkspacesConfig(this.workspaces, this.activeWorkspace);
+    }
+
+    _switchToPreviousWorkspace() {
+        const currentIndex = this.workspaces.indexOf(this.activeWorkspace);
+        // Вычисляем предыдущий индекс с учетом цикличности
+        const prevIndex = currentIndex > 0 ? currentIndex - 1 : this.workspaces.length - 1;
+        const prevWorkspace = this.workspaces[prevIndex];
+        
+        this._switchWorkspace(prevWorkspace);
+        
+        // Обновляем визуальное выделение кнопок
+        const workspaceButtons = this.menu.box.get_children()
+            .find(child => child.style_class === 'workspace-buttons-container')
+            .get_children()
+            .filter(child => child.style_class === 'workspace-button'); // Фильтруем только кнопки workspace
+            
+        workspaceButtons.forEach(button => button.remove_style_pseudo_class('active'));
+        workspaceButtons[prevIndex].add_style_pseudo_class('active');
+    }
+
+    _switchToNextWorkspace() {
+        const currentIndex = this.workspaces.indexOf(this.activeWorkspace);
+        // Вычисляем следующий индекс с учетом цикличности
+        const nextIndex = currentIndex < this.workspaces.length - 1 ? currentIndex + 1 : 0;
+        const nextWorkspace = this.workspaces[nextIndex];
+        
+        this._switchWorkspace(nextWorkspace);
+        
+        // Обновляем визуальное выделение кнопок
+        const workspaceButtons = this.menu.box.get_children()
+            .find(child => child.style_class === 'workspace-buttons-container')
+            .get_children()
+            .filter(child => child.style_class === 'workspace-button'); // Фильтруем только кнопки workspace
+            
+        workspaceButtons.forEach(button => button.remove_style_pseudo_class('active'));
+        workspaceButtons[nextIndex].add_style_pseudo_class('active');
     }
 });

@@ -26,11 +26,11 @@
         </description>
     </key>
 
-    <key type="i" name="history-size">
+    <key name="history-size" type="i">
         <default>15</default>
-        <summary>The number of items to save in history</summary>
-        <description></description>
-        <range min="1" max="200"/>
+        <summary>History size</summary>
+        <description>Number of items in history (0 for unlimited)</description>
+        <range min="0" max="10000"/>
     </key>
 
     <key type="i" name="display-mode">
