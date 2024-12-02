@@ -754,6 +754,24 @@ const ClipboardIndicator = GObject.registerClass({
     }
 
     _addEntry (entry, autoSelect, autoSetClip) {
+        // Если это изображение и уже достигнут лимит, удалим самое старое изображение из истории
+        if (entry.isImage()) {
+            const imageEntries = this.clipItemsRadioGroup
+                .filter(item => item.entry.isImage())
+                .sort((a, b) => {
+                    // Сортируем по времени добавления (предполагаем, что более старые элементы находятся в начале массива)
+                    const indexA = this.clipItemsRadioGroup.indexOf(a);
+                    const indexB = this.clipItemsRadioGroup.indexOf(b);
+                    return indexA - indexB;
+                });
+
+            if (imageEntries.length >= this.registry.MAX_IMAGES_PER_WORKSPACE) {
+                // Удаляем самое старое изображение
+                const oldestImage = imageEntries[0];
+                this._removeEntry(oldestImage);
+            }
+        }
+
         let menuItem = new PopupMenu.PopupMenuItem('');
 
         menuItem.menu = this.menu;

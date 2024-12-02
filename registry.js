@@ -11,6 +11,7 @@ export class Registry {
     constructor(extension) {
         this.extension = extension;
         this.cacheDir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'clipboard-indicator']);
+        this.MAX_IMAGES_PER_WORKSPACE = 3;
         GLib.mkdir_with_parents(this.cacheDir, 0o775);
     }
 
@@ -118,7 +119,7 @@ export class Registry {
         return GLib.build_filenamev([this._getImagesCacheDir(workspace), entry.imageHash]);
     }
 
-    writeEntryFile(entry, workspace) {
+    async writeEntryFile(entry, workspace) {
         if (!entry || !entry.isImage()) return;
         if (!workspace) {
             console.error('Workspace name is undefined');
@@ -129,6 +130,23 @@ export class Registry {
         if (!path) return;
         
         try {
+            // Проверяем количество существующих изображений в workspace
+            const imageFiles = this.#getWorkspaceImageFiles(workspace);
+            
+            // Если достигнут лимит, удаляем самое старое изображение
+            if (imageFiles.length >= this.MAX_IMAGES_PER_WORKSPACE) {
+                // Сортируем файлы по времени модификации
+                imageFiles.sort((a, b) => {
+                    const statA = a.query_info('time::modified', Gio.FileQueryInfoFlags.NONE, null);
+                    const statB = b.query_info('time::modified', Gio.FileQueryInfoFlags.NONE, null);
+                    return statA.get_modification_date_time().compare(statB.get_modification_date_time());
+                });
+                
+                // Удаляем самый старый файл
+                imageFiles[0].delete(null);
+            }
+            
+            // Записываем новое изображение
             const bytes = entry.asBytes().get_data();
             if (!bytes) {
                 console.error('No image data to write');
@@ -140,6 +158,29 @@ export class Registry {
             console.error('Failed to write image file:', e);
             return false;
         }
+    }
+
+    // Добавляем новый приватный метод для получения списка файлов изображений в workspace
+    #getWorkspaceImageFiles(workspace) {
+        const dir = Gio.File.new_for_path(this._getWorkspaceDir(workspace));
+        const imageFiles = [];
+        
+        try {
+            const enumerator = dir.enumerate_children('standard::*', Gio.FileQueryInfoFlags.NONE, null);
+            let fileInfo;
+            while ((fileInfo = enumerator.next_file(null))) {
+                const fileName = fileInfo.get_name();
+                // Проверяем, что файл является изображением (имеет hash в имени)
+                if (fileName.match(/[a-z0-9]+$/)) {
+                    const file = dir.get_child(fileName);
+                    imageFiles.push(file);
+                }
+            }
+        } catch (e) {
+            console.error('Failed to get workspace image files:', e);
+        }
+        
+        return imageFiles;
     }
 
     deleteEntryFile(entry, workspace) {
