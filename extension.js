@@ -39,6 +39,7 @@ let STRIP_TEXT                = false;
 let KEEP_SELECTED_ON_CLEAR    = false;
 let PASTE_BUTTON              = true;
 let PINNED_ON_BOTTOM          = false;
+let cacheLock = false;
 
 export default class ClipboardIndicatorExtension extends Extension {
     enable () {
@@ -1018,11 +1019,17 @@ const ClipboardIndicator = GObject.registerClass({
     }
 
     _updateCache () {
-        const entries = this.clipItemsRadioGroup
-            .map(menuItem => menuItem.entry)
-            .filter(entry => CACHE_ONLY_FAVORITE == false || entry.isFavorite());
+        if (cacheLock) return;
+        cacheLock = true;
+        try {
+            const entries = this.clipItemsRadioGroup
+                .map(menuItem => menuItem.entry)
+                .filter(entry => CACHE_ONLY_FAVORITE == false || entry.isFavorite());
 
-        this.registry.write(entries, this.activeWorkspace);
+            this.registry.write(entries, this.activeWorkspace);
+        } finally {
+            cacheLock = false;
+        }
     }
 
     #addToCache (entry) {
@@ -1563,9 +1570,8 @@ const ClipboardIndicator = GObject.registerClass({
         try {
             // Проверяем существование workspace в списке
             if (!this.workspaces.includes(name)) {
-                console.error('Workspace not found:', name);
-                // Если workspace не существует, переключаемся на первый доступный
-                name = this.workspaces[0];
+                console.error('Invalid workspace name:', name);
+                return;
             }
 
             // Сохраняем текущее состояние перед переключением
